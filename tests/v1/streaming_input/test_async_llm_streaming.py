@@ -12,7 +12,7 @@ from vllm.outputs import STREAM_FINISHED, RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
-from vllm.v1.engine.output_processor import RequestOutputCollector
+from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 
 
 @pytest.fixture
@@ -198,6 +198,60 @@ async def test_final_dispatch_keeps_input_task_cancellable(streaming_llm):
             await asyncio.wait_for(tasks[0], timeout=2)
     assert final_cancelled.is_set()
     assert queues[0]._input_stream_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_via", ["task", "shutdown", "threaded_shutdown"])
+async def test_output_handler_cancellation_terminates_generate(
+    mock_async_llm, cancel_via
+):
+    llm = mock_async_llm
+    queue = RequestOutputCollector(RequestOutputKind.DELTA, "request")
+    handler_started = asyncio.Event()
+    consumer_started = asyncio.Event()
+
+    async def get_output():
+        handler_started.set()
+        await asyncio.Future()
+
+    async def add_request(*args, **kwargs):
+        consumer_started.set()
+        return queue
+
+    processor = OutputProcessor.__new__(OutputProcessor)
+    processor.request_states = {"request": MagicMock(queue=queue)}
+    processor.propagate_error = MagicMock(wraps=processor.propagate_error)
+    llm.output_processor = processor
+    llm.engine_core = MagicMock()
+    llm.engine_core.get_output_async = get_output
+    llm.renderer = MagicMock()
+    llm.log_stats = False
+    llm.logger_manager = None
+    llm.output_handler = None
+    llm.add_request = add_request
+    AsyncLLM._run_output_handler(llm)
+    consumer = asyncio.create_task(consume_stream(llm, "hello"))
+    try:
+        await asyncio.wait_for(handler_started.wait(), timeout=2)
+        await asyncio.wait_for(consumer_started.wait(), timeout=2)
+        if cancel_via == "task":
+            llm.output_handler.cancel()
+        elif cancel_via == "shutdown":
+            AsyncLLM.shutdown(llm)
+        else:
+            await asyncio.wait_for(asyncio.to_thread(AsyncLLM.shutdown, llm), timeout=2)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(llm.output_handler, timeout=2)
+        with pytest.raises(EngineDeadError):
+            await asyncio.wait_for(consumer, timeout=2)
+        processor.propagate_error.assert_called_once()
+        llm.abort.assert_not_awaited()
+        assert queue.get_nowait() is None
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        llm.output_handler.cancel()
+        await asyncio.gather(llm.output_handler, return_exceptions=True)
 
 
 @pytest.fixture
