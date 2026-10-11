@@ -11,7 +11,193 @@ from vllm.engine.protocol import StreamingInput
 from vllm.outputs import STREAM_FINISHED, RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.output_processor import RequestOutputCollector
+
+
+@pytest.fixture
+def streaming_llm(mock_async_llm):
+    llm = mock_async_llm
+    llm.get_supported_tasks = AsyncMock(return_value=("generate",))
+    llm._add_streaming_input_request = AsyncLLM._add_streaming_input_request.__get__(
+        llm, AsyncLLM
+    )
+    llm.input_processor = MagicMock()
+    llm.input_processor.process_inputs.side_effect = lambda **kwargs: MagicMock(
+        request_id="request",
+        prompt_embeds=None,
+        resumable=kwargs.get("resumable", False),
+    )
+    queues = []
+    tasks = []
+
+    async def add_request(request_id, prompt, params, **kwargs):
+        queue = await llm._add_streaming_input_request(request_id, prompt, params)
+        queues.append(queue)
+        tasks.append(queue._input_stream_task)
+        return queue
+
+    llm.add_request = add_request
+    llm._add_request = AsyncMock()
+    return llm, queues, tasks
+
+
+async def consume_stream(llm, stream):
+    async for _ in llm.generate(stream, SamplingParams(max_tokens=4), "request"):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("num_chunks", [0, 1, 3])
+async def test_input_stream_error_does_not_send_final_sentinel(
+    streaming_llm, num_chunks
+):
+    llm, queues, tasks = streaming_llm
+    error = ValueError("input failed")
+
+    async def stream():
+        for _ in range(num_chunks):
+            yield StreamingInput(prompt="hello")
+        raise error
+
+    with pytest.raises(ValueError, match="input failed") as caught:
+        await asyncio.wait_for(consume_stream(llm, stream()), timeout=2)
+    assert caught.value is error
+    await asyncio.wait_for(tasks[0], timeout=2)
+    assert llm._add_request.await_count == num_chunks
+    assert all(call.args[0].resumable for call in llm._add_request.await_args_list)
+    llm.abort.assert_awaited_once_with("request", internal=True)
+    assert queues[0].get_nowait() is None
+    assert queues[0]._input_stream_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_dead", [False, True])
+async def test_final_request_failure_does_not_deadlock_generate(
+    streaming_llm, engine_dead
+):
+    llm, queues, tasks = streaming_llm
+    error = EngineDeadError() if engine_dead else RuntimeError("final dispatch failed")
+
+    async def submit(req, *args):
+        if not req.resumable:
+            raise error
+
+    llm._add_request.side_effect = submit
+
+    async def stream():
+        yield StreamingInput(prompt="hello")
+
+    expected = EngineDeadError if engine_dead else EngineGenerateError
+    with pytest.raises(expected) as caught:
+        await asyncio.wait_for(consume_stream(llm, stream()), timeout=2)
+    if engine_dead:
+        assert caught.value is error
+        llm.abort.assert_not_awaited()
+    else:
+        assert caught.value.__cause__ is error
+        llm.abort.assert_awaited_once_with("request", internal=True)
+    await asyncio.wait_for(tasks[0], timeout=2)
+    assert llm._add_request.await_count == 2
+    assert queues[0].get_nowait() is None
+    assert queues[0]._input_stream_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("num_chunks", [0, 3])
+async def test_streaming_input_normal_finalization(streaming_llm, num_chunks):
+    llm, queues, tasks = streaming_llm
+
+    async def submit(req, prompt, parent, index, queue):
+        if not req.resumable:
+            queue.put(make_output("request", finished=True))
+
+    llm._add_request.side_effect = submit
+
+    async def stream():
+        for _ in range(num_chunks):
+            yield StreamingInput(prompt="hello")
+
+    await asyncio.wait_for(consume_stream(llm, stream()), timeout=2)
+    await asyncio.wait_for(tasks[0], timeout=2)
+    assert llm._add_request.await_count == (num_chunks + 1 if num_chunks else 0)
+    llm.abort.assert_not_awaited()
+    assert queues[0]._input_stream_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early_stop", [False, True])
+async def test_streaming_input_consumer_cancellation_stops_input(
+    streaming_llm, early_stop
+):
+    llm, queues, tasks = streaming_llm
+    submitted = asyncio.Event()
+    input_closed = asyncio.Event()
+
+    async def submit(req, prompt, parent, index, queue):
+        queue.put(make_output("request", finished=False))
+        submitted.set()
+
+    llm._add_request.side_effect = submit
+
+    async def stream():
+        try:
+            yield StreamingInput(prompt="hello")
+            await asyncio.Future()
+        finally:
+            input_closed.set()
+
+    if early_stop:
+        consumer = llm.generate(stream(), SamplingParams(max_tokens=4), "request")
+        await asyncio.wait_for(anext(consumer), timeout=2)
+        await asyncio.wait_for(consumer.aclose(), timeout=2)
+    else:
+        consumer = asyncio.create_task(consume_stream(llm, stream()))
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(consumer, timeout=2)
+    await asyncio.wait_for(input_closed.wait(), timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(tasks[0], timeout=2)
+    assert llm._add_request.await_count == 1
+    llm.abort.assert_awaited_once_with("request", internal=True)
+    assert queues[0].get_nowait() is None
+    assert queues[0]._input_stream_task is None
+
+
+@pytest.mark.asyncio
+async def test_final_dispatch_keeps_input_task_cancellable(streaming_llm):
+    llm, queues, tasks = streaming_llm
+    final_started = asyncio.Event()
+    final_cancelled = asyncio.Event()
+
+    async def submit(req, *args):
+        if not req.resumable:
+            final_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                final_cancelled.set()
+
+    llm._add_request.side_effect = submit
+
+    async def stream():
+        yield StreamingInput(prompt="hello")
+
+    consumer = asyncio.create_task(consume_stream(llm, stream()))
+    try:
+        await asyncio.wait_for(final_started.wait(), timeout=2)
+        assert queues[0]._input_stream_task is tasks[0]
+    finally:
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(consumer, timeout=2)
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(tasks[0], timeout=2)
+    assert final_cancelled.is_set()
+    assert queues[0]._input_stream_task is None
 
 
 @pytest.fixture
