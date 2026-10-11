@@ -2633,7 +2633,20 @@ class Scheduler(SchedulerInterface):
                 existing.streaming_queue.append(update)
             elif update is not None:
                 # Commence next input chunk.
-                self._update_request_as_session(existing, update)
+                if self.policy == SchedulingPolicy.PRIORITY:
+                    request_queue = (
+                        self.kv_holding_waiting
+                        if self._holds_kv_blocks(existing)
+                        else self.waiting
+                    )
+                    # arrival_time is a heap key; remove before mutating it.
+                    request_queue.remove_request(existing)
+                    try:
+                        self._update_request_as_session(existing, update)
+                    finally:
+                        request_queue.add_request(existing)
+                else:
+                    self._update_request_as_session(existing, update)
             else:
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)

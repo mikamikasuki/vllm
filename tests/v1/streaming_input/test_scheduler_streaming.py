@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
@@ -21,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import (
     hash_block_tokens,
     init_none_hash,
 )
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -33,6 +35,79 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.structured_output import StructuredOutputManager
 
 STOP_TOKEN = 128001
+
+
+@pytest.mark.parametrize("policy", ["priority", "fcfs"])
+@pytest.mark.parametrize("holds_kv", [False, True])
+@pytest.mark.parametrize("distinct_priority", [False, True])
+def test_priority_queue_heap_invariant_on_streaming_continuation(
+    policy, holds_kv, distinct_priority
+):
+    """Continuation arrival times reorder heaps without moving FCFS sessions."""
+    scheduler = create_scheduler()
+    scheduler.policy = SchedulingPolicy(policy)
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
+    scheduler.max_num_running_reqs = 1
+    scheduler.max_num_active_reqs = 1
+    sessions = [DummyRequest(name, prompt_token_ids=[1]) for name in ("A", "B", "C")]
+    if distinct_priority:
+        sessions[2].priority = -1
+    for arrival, session in enumerate(sessions):
+        session.arrival_time = float(arrival)
+        scheduler.add_request(session)
+        scheduler.waiting.remove_request(session)
+        if holds_kv:
+            scheduler.kv_cache_manager.allocate_slots(session, 1)
+            session.num_computed_tokens = 1
+        assert not scheduler._handle_stopped_request(session)
+
+    for name, arrival in (("B", 4.0), ("A", 10.0), ("C", 3.0)):
+        continuation = DummyRequest(name, prompt_token_ids=[2])
+        continuation.arrival_time = arrival
+        scheduler.add_request(continuation)
+
+    owner = scheduler.kv_holding_waiting if holds_kv else scheduler.waiting
+    other = scheduler.waiting if holds_kv else scheduler.kv_holding_waiting
+    assert not other
+    assert len(owner) == 3
+    assert set(owner) == set(sessions)
+    assert all(session.status == RequestStatus.WAITING for session in sessions)
+    assert scheduler.num_waiting_for_streaming_input == 0
+    expected = ["C", "B", "A"] if policy == "priority" else ["A", "B", "C"]
+    assert [session.request_id for session in owner] == expected
+    scheduled = scheduler.schedule()
+    assert list(scheduled.num_scheduled_tokens) == expected[:1]
+    assert len(scheduler.running) == 1
+    assert len(owner) == 2
+    assert scheduler.running[0] not in scheduler.deferred_waiting
+
+
+@pytest.mark.parametrize("holds_kv", [False, True])
+def test_priority_continuation_update_failure_preserves_queue(holds_kv):
+    """An unexpected update failure must not lose the parked session."""
+    scheduler = create_scheduler()
+    scheduler.policy = SchedulingPolicy.PRIORITY
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
+    session = DummyRequest("session", prompt_token_ids=[1])
+    session.num_computed_tokens = int(holds_kv)
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    scheduler.requests[session.request_id] = session
+    scheduler._enqueue_waiting_request(session)
+    owner = scheduler.kv_holding_waiting if holds_kv else scheduler.waiting
+
+    def fail_update(existing, update):
+        assert not owner
+        existing.arrival_time = update.arrival_time
+        raise RuntimeError("update failed")
+
+    scheduler._update_request_as_session = fail_update
+    continuation = DummyRequest("session", prompt_token_ids=[2])
+    with pytest.raises(RuntimeError, match="update failed"):
+        scheduler.add_request(continuation)
+    assert list(owner) == [session]
+    assert session in scheduler.deferred_waiting
 
 
 class DummyRequest(Request):
